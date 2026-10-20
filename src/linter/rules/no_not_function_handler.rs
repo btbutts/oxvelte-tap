@@ -7,6 +7,7 @@ use oxc::ast::ast::{Expression, VariableDeclarationKind};
 use oxc::ast::AstKind;
 use oxc::semantic::Semantic;
 use oxc::span::Span;
+use rustc_hash::FxHashSet;
 
 pub struct NoNotFunctionHandler;
 
@@ -219,7 +220,7 @@ fn check_handler<'a>(
     // Vendor's `findRootExpression`: follow `const` aliases all the way down.
     let resolved = if let Expression::Identifier(id) = expr {
         ctx.instance_semantic
-            .and_then(|sem| resolve_const_init(id.name.as_str(), sem))
+            .and_then(|sem| resolve_const_init(id.name.as_str(), sem, &mut FxHashSet::default()))
             .unwrap_or(expr)
     } else {
         expr
@@ -251,7 +252,15 @@ fn non_function_phrase(expr: &Expression<'_>) -> Option<&'static str> {
 /// Look up `name` in the instance-script root scope. If it's bound by
 /// `const X = init`, return `init` (recursively, so chains of `const`
 /// renames are followed). Otherwise `None`.
-fn resolve_const_init<'a>(name: &str, sem: &'a Semantic<'a>) -> Option<&'a Expression<'a>> {
+fn resolve_const_init<'a>(
+    name: &str,
+    sem: &'a Semantic<'a>,
+    seen: &mut FxHashSet<String>,
+) -> Option<&'a Expression<'a>> {
+    if !seen.insert(name.to_string()) {
+        // Cyclic const alias (e.g. `const a = a;`) — treat as unresolvable.
+        return None;
+    }
     let scoping = sem.scoping();
     let sid = scoping.find_binding(scoping.root_scope_id(), name.into())?;
     if scoping
@@ -280,7 +289,7 @@ fn resolve_const_init<'a>(name: &str, sem: &'a Semantic<'a>) -> Option<&'a Expre
     let init = vd.init.as_ref()?;
     // Recursively follow chained const aliases.
     if let Expression::Identifier(inner) = init {
-        return resolve_const_init(inner.name.as_str(), sem).or(Some(init));
+        return resolve_const_init(inner.name.as_str(), sem, seen).or(Some(init));
     }
     Some(init)
 }

@@ -44,6 +44,15 @@ pub fn parse_fragment_with_errors<'a>(
     }
 }
 
+/// Maximum number of simultaneously open template nodes (elements and
+/// blocks, including `{:else if}` / `{:else}` chain links). Bounds the
+/// depth of the resulting AST so recursive consumers — the ESTree
+/// serializers, linter-side tree walkers, and `Drop` glue for the node
+/// tree itself — stay within their stack budgets. Far above anything
+/// hand-written; deeply machine-nested input gets a clear parse error
+/// instead of a stack-overflow abort.
+const MAX_OPEN_NODE_DEPTH: usize = 1000;
+
 /// The template parser state machine.
 struct TemplateParser<'a> {
     source: &'a str,
@@ -77,9 +86,11 @@ struct TemplateParser<'a> {
 enum FragmentStep<'a> {
     Node(TemplateNode<'a>),
     /// The dispatch step encountered a token that can't be handled inside
-    /// the current frame (an unmatched block close, a block continuation
-    /// that no flat block on the stack claimed, etc.). The reason payload
-    /// isn't needed — only the fact that the loop should break is.
+    /// the current frame (an unmatched block close or stray element close
+    /// bubbling out of a recovery frame). The reason payload isn't needed —
+    /// only the fact that the loop should break is. Misplaced `{:...}`
+    /// continuations are NOT part of this: they are reported and skipped
+    /// inline so parsing always continues past them.
     Exit,
     Continue,
 }
@@ -879,6 +890,9 @@ impl<'a> TemplateParser<'a> {
             self.open_nodes.last(),
             Some(OpenNode::Block(OpenBlock::If { .. }))
         ));
+        if self.at_template_depth_limit() {
+            return Ok(());
+        }
         let fragment_end = self.pos as u32;
         let fragment_nodes = self.exit_fragment();
 
@@ -1080,6 +1094,9 @@ impl<'a> TemplateParser<'a> {
             self.open_nodes.last(),
             Some(OpenNode::Block(OpenBlock::If { .. }))
         ));
+        if self.at_template_depth_limit() {
+            return Ok(());
+        }
         let fragment_end = self.pos as u32;
         let fragment_nodes = self.exit_fragment();
 
@@ -1263,16 +1280,31 @@ impl<'a> TemplateParser<'a> {
         self.enter_fragment();
 
         while self.pos < self.source.len() {
-            match self.parse_fragment_step(frame)? {
+            let step = match self.parse_fragment_step(frame) {
+                Ok(step) => step,
+                Err(error) => {
+                    // Recover from node-level parse errors (unterminated
+                    // comments, malformed block headers, ...): record the
+                    // diagnostic, skip to the next plausible token, and keep
+                    // parsing instead of discarding the fragment parsed so far.
+                    self.errors.push(error);
+                    self.resync_after_error();
+                    continue;
+                }
+            };
+            match step {
                 FragmentStep::Node(node) => self.append(node),
                 FragmentStep::Exit => {
-                    // If a block close / continuation / stray close is bubbling
-                    // up while entries are still open inside this frame's
-                    // scope, implicit-close them first and re-poll the same
-                    // token. Eventually the open-node stack drops back to
-                    // the checkpoint and the exit propagates to the caller.
+                    // If a block close / stray close is bubbling up while
+                    // entries are still open inside this frame's scope,
+                    // implicit-close them first and re-poll the same token.
+                    // Eventually the open-node stack drops back to the
+                    // checkpoint and the exit propagates to the caller.
                     if self.open_nodes.len() > open_nodes_checkpoint {
-                        self.drain_implicit_close_top()?;
+                        if let Err(error) = self.drain_implicit_close_top() {
+                            self.errors.push(error);
+                            self.resync_after_error();
+                        }
                         continue;
                     }
                     break;
@@ -1285,7 +1317,10 @@ impl<'a> TemplateParser<'a> {
         // finalized. The innermost entry gets Svelte's "left open" diagnostic
         // via `reported_unclosed_eof` deduplication.
         while self.open_nodes.len() > open_nodes_checkpoint {
-            self.drain_implicit_close_top_at_eof()?;
+            if let Err(error) = self.drain_implicit_close_top_at_eof() {
+                self.errors.push(error);
+                break;
+            }
         }
 
         let nodes = self.exit_fragment();
@@ -1429,13 +1464,14 @@ impl<'a> TemplateParser<'a> {
                 .peek_block_continuation()
                 .unwrap_or(BlockContinuation::Other);
 
-            // If the topmost flat block in this frame is `{#each}` or `{#if}`,
-            // handle the continuation inline. Other blocks (Key, Snippet) and
-            // elements fall through to bubble Exit; the surrounding
-            // `parse_fragment_frame` drains those entries via
-            // `drain_implicit_close_top`, which reports the block-specific
-            // "Unclosed kind block" diagnostic that matches the pre-flatten
-            // `recover_block_close` else-branch.
+            // If the innermost open node in this frame is an `{#each}`,
+            // `{#if}`, or `{#await}` block, it claims the continuation inline
+            // (or reports the wrong-continuation-kind error). Anything else
+            // on top — an open element, a Key/Snippet block, or nothing at
+            // all — falls through to the invalid-placement recovery below,
+            // mirroring vendor Svelte's `next()`, which only consults the
+            // innermost stack entry and never closes an element to reach an
+            // outer block.
             let checkpoint = self.current_frame_open_nodes_checkpoint();
             if self.open_nodes.len() > checkpoint {
                 match self.open_nodes.last().unwrap() {
@@ -1490,15 +1526,20 @@ impl<'a> TemplateParser<'a> {
                     },
                     OpenNode::Block(OpenBlock::Key { .. } | OpenBlock::Snippet { .. })
                     | OpenNode::Element(_) => {
-                        // Bubble — drain handler closes element/Key/Snippet.
+                        // Fall through to invalid-placement handling below.
                     }
                 }
             }
 
-            // Block continuation tag the topmost flat block didn't claim —
-            // bubble up so a recovery frame (or root) can move past it.
-            let _ = continuation;
-            Ok(FragmentStep::Exit)
+            // Vendor's `block_invalid_continuation_placement`: report, skip
+            // just the tag, and keep parsing with every open node intact —
+            // the following content stays inside the enclosing element/block
+            // and no spurious close diagnostics follow.
+            self.report_error(
+                "{:...} block is invalid at this position (did you forget to close the preceding element or block?)",
+            );
+            self.consume_continuation_tag()?;
+            Ok(FragmentStep::Continue)
         } else if self.looking_at("<!--") {
             self.parse_comment().map(FragmentStep::Node)
         } else if self.looking_at_svelte_keyword_missing_whitespace(
@@ -1703,6 +1744,37 @@ impl<'a> TemplateParser<'a> {
         self.errors.push(OxcDiagnostic::error(message.into()));
     }
 
+    /// Recovery after a node-level parse error: guarantee forward progress by
+    /// one full UTF-8 character, then skip to the next plausible token start
+    /// (`<` or `{`) so the frame loop can resume parsing instead of
+    /// abandoning the fragment parsed so far.
+    fn resync_after_error(&mut self) {
+        let bytes = self.source.as_bytes();
+        if self.pos < bytes.len() {
+            self.pos += 1;
+            while self.pos < bytes.len() && (bytes[self.pos] & 0xC0) == 0x80 {
+                self.pos += 1;
+            }
+        }
+        while self.pos < bytes.len() && bytes[self.pos] != b'<' && bytes[self.pos] != b'{' {
+            self.pos += 1;
+        }
+    }
+
+    /// Depth-limit guard consulted before pushing a new entry onto
+    /// `open_nodes`. At the cap, reports a parse error and jumps to EOF so
+    /// the normal end-of-input drain finalizes everything already open.
+    fn at_template_depth_limit(&mut self) -> bool {
+        if self.open_nodes.len() < MAX_OPEN_NODE_DEPTH {
+            return false;
+        }
+        self.report_error(format!(
+            "Maximum template nesting depth ({MAX_OPEN_NODE_DEPTH}) exceeded"
+        ));
+        self.pos = self.source.len();
+        true
+    }
+
     fn report_reserved_binding_identifier_diagnostic(&mut self, identifier: &str) {
         let identifier = identifier.trim();
         if oxc::syntax::keyword::is_reserved_keyword(identifier) {
@@ -1738,6 +1810,19 @@ impl<'a> TemplateParser<'a> {
         // Parse the malformed continuation's body in a recovery frame; its
         // nodes are discarded along with the returned `Fragment`.
         let _ = self.parse_fragment_frame(FragmentFrame::recovery_block())?;
+        Ok(())
+    }
+
+    /// Eat a `{:...}` continuation tag header only. Unlike
+    /// `consume_continuation_body`, the content after the tag is left for the
+    /// enclosing frame — used when recovering from a stray continuation at
+    /// root scope, where the following nodes are real template content.
+    fn consume_continuation_tag(&mut self) -> Result<(), OxcDiagnostic> {
+        self.eat("{:")?;
+        self.eat_until("}");
+        if self.looking_at("}") {
+            self.eat("}")?;
+        }
         Ok(())
     }
 
@@ -2473,6 +2558,10 @@ impl<'a> TemplateParser<'a> {
         // open a fresh child fragment. The dispatch loop will continue parsing
         // children directly into that fragment, and `finalize_top_open_element`
         // will assemble the final `Element` when the close arrives.
+        if self.at_template_depth_limit() {
+            self.exit_element_context(context);
+            return Ok(FragmentStep::Continue);
+        }
         self.open_nodes.push(OpenNode::Element(OpenElement {
             name,
             name_span,
@@ -2996,57 +3085,134 @@ impl<'a> TemplateParser<'a> {
         nodes: &[TemplateNode<'a>],
         ancestors: &mut Vec<SlotAncestor>,
     ) {
-        for node in nodes {
-            match node {
-                TemplateNode::Element(element) => {
-                    self.report_slot_attribute_diagnostics(element, ancestors);
-                    self.report_component_slot_children_diagnostics(element);
-                    self.report_component_snippet_children_diagnostics(element);
+        // Explicit-stack traversal: `Node` visits happen in source order
+        // while `PushAncestor` / `PopAncestor` reproduce the recursive
+        // version's ancestor-stack discipline without consuming call stack
+        // on deeply nested templates.
+        enum Work<'node, 'a> {
+            Node(&'node TemplateNode<'a>),
+            PushAncestor(SlotAncestor),
+            PopAncestor,
+        }
 
-                    ancestors.push(SlotAncestor {
-                        kind: slot_ancestor_kind(element),
-                    });
-                    self.report_slot_attribute_tree_diagnostics(&element.children, ancestors);
+        let mut stack: Vec<Work<'_, 'a>> = Vec::new();
+        stack.extend(nodes.iter().rev().map(Work::Node));
+        while let Some(work) = stack.pop() {
+            match work {
+                Work::PushAncestor(ancestor) => ancestors.push(ancestor),
+                Work::PopAncestor => {
                     ancestors.pop();
+                }
+                Work::Node(node) => match node {
+                    TemplateNode::Element(element) => {
+                        self.report_slot_attribute_diagnostics(element, ancestors);
+                        self.report_component_slot_children_diagnostics(element);
+                        self.report_component_snippet_children_diagnostics(element);
+
+                        stack.push(Work::PopAncestor);
+                        stack.extend(element.children.iter().rev().map(Work::Node));
+                        stack.push(Work::PushAncestor(SlotAncestor {
+                            kind: slot_ancestor_kind(element),
+                        }));
+                    }
+                    TemplateNode::IfBlock(block) => {
+                        if let Some(alternate) = &block.alternate {
+                            stack.push(Work::PopAncestor);
+                            stack.push(Work::Node(alternate.as_ref()));
+                            stack.push(Work::PushAncestor(SlotAncestor::block()));
+                        }
+                        stack.push(Work::PopAncestor);
+                        stack.extend(block.consequent.nodes.iter().rev().map(Work::Node));
+                        stack.push(Work::PushAncestor(SlotAncestor::block()));
+                    }
+                    TemplateNode::EachBlock(block) => {
+                        if let Some(fallback) = &block.fallback {
+                            stack.push(Work::PopAncestor);
+                            stack.extend(fallback.nodes.iter().rev().map(Work::Node));
+                            stack.push(Work::PushAncestor(SlotAncestor::block()));
+                        }
+                        stack.push(Work::PopAncestor);
+                        stack.extend(block.body.nodes.iter().rev().map(Work::Node));
+                        stack.push(Work::PushAncestor(SlotAncestor::block()));
+                    }
+                    TemplateNode::AwaitBlock(block) => {
+                        let fragments: Vec<&Fragment> = await_block_fragments(block).collect();
+                        for fragment in fragments.into_iter().rev() {
+                            stack.push(Work::PopAncestor);
+                            stack.extend(fragment.nodes.iter().rev().map(Work::Node));
+                            stack.push(Work::PushAncestor(SlotAncestor::block()));
+                        }
+                    }
+                    TemplateNode::KeyBlock(block) => {
+                        stack.push(Work::PopAncestor);
+                        stack.extend(block.body.nodes.iter().rev().map(Work::Node));
+                        stack.push(Work::PushAncestor(SlotAncestor::block()));
+                    }
+                    TemplateNode::SnippetBlock(block) => {
+                        stack.push(Work::PopAncestor);
+                        stack.extend(block.body.nodes.iter().rev().map(Work::Node));
+                        stack.push(Work::PushAncestor(SlotAncestor::snippet_block()));
+                    }
+                    TemplateNode::Text(_)
+                    | TemplateNode::MustacheTag(_)
+                    | TemplateNode::RawMustacheTag(_)
+                    | TemplateNode::DebugTag(_)
+                    | TemplateNode::ConstTag(_)
+                    | TemplateNode::RenderTag(_)
+                    | TemplateNode::Comment(_) => {}
+                },
+            }
+        }
+    }
+
+    fn report_const_tag_placement_diagnostics(
+        &mut self,
+        nodes: &[TemplateNode<'a>],
+        const_allowed: bool,
+    ) {
+        // Explicit-stack traversal (children pushed in reverse so nodes
+        // are checked in source order) — deeply nested templates must not
+        // overflow the call stack.
+        let mut stack: Vec<(&TemplateNode<'a>, bool)> = Vec::new();
+        stack.extend(nodes.iter().rev().map(|n| (n, const_allowed)));
+        while let Some((node, const_allowed)) = stack.pop() {
+            match node {
+                TemplateNode::ConstTag(_) if !const_allowed => {
+                    self.report_error(const_tag_invalid_placement_message());
+                }
+                TemplateNode::Element(element) => {
+                    let next_allowed = const_tag_allowed_in_element(element);
+                    stack.extend(
+                        element
+                            .children
+                            .iter()
+                            .rev()
+                            .map(|n| (n, next_allowed)),
+                    );
                 }
                 TemplateNode::IfBlock(block) => {
-                    ancestors.push(SlotAncestor::block());
-                    self.report_slot_attribute_tree_diagnostics(&block.consequent.nodes, ancestors);
-                    ancestors.pop();
-
                     if let Some(alternate) = &block.alternate {
-                        ancestors.push(SlotAncestor::block());
-                        self.report_slot_attribute_node_diagnostics(alternate, ancestors);
-                        ancestors.pop();
+                        stack.push((alternate.as_ref(), true));
                     }
+                    stack.extend(block.consequent.nodes.iter().rev().map(|n| (n, true)));
                 }
                 TemplateNode::EachBlock(block) => {
-                    ancestors.push(SlotAncestor::block());
-                    self.report_slot_attribute_tree_diagnostics(&block.body.nodes, ancestors);
-                    ancestors.pop();
-
                     if let Some(fallback) = &block.fallback {
-                        ancestors.push(SlotAncestor::block());
-                        self.report_slot_attribute_tree_diagnostics(&fallback.nodes, ancestors);
-                        ancestors.pop();
+                        stack.extend(fallback.nodes.iter().rev().map(|n| (n, true)));
                     }
+                    stack.extend(block.body.nodes.iter().rev().map(|n| (n, true)));
                 }
                 TemplateNode::AwaitBlock(block) => {
-                    for fragment in await_block_fragments(block) {
-                        ancestors.push(SlotAncestor::block());
-                        self.report_slot_attribute_tree_diagnostics(&fragment.nodes, ancestors);
-                        ancestors.pop();
+                    let fragments: Vec<&Fragment> = await_block_fragments(block).collect();
+                    for fragment in fragments.into_iter().rev() {
+                        stack.extend(fragment.nodes.iter().rev().map(|n| (n, true)));
                     }
                 }
                 TemplateNode::KeyBlock(block) => {
-                    ancestors.push(SlotAncestor::block());
-                    self.report_slot_attribute_tree_diagnostics(&block.body.nodes, ancestors);
-                    ancestors.pop();
+                    stack.extend(block.body.nodes.iter().rev().map(|n| (n, true)));
                 }
                 TemplateNode::SnippetBlock(block) => {
-                    ancestors.push(SlotAncestor::snippet_block());
-                    self.report_slot_attribute_tree_diagnostics(&block.body.nodes, ancestors);
-                    ancestors.pop();
+                    stack.extend(block.body.nodes.iter().rev().map(|n| (n, true)));
                 }
                 TemplateNode::Text(_)
                 | TemplateNode::MustacheTag(_)
@@ -3059,127 +3225,92 @@ impl<'a> TemplateParser<'a> {
         }
     }
 
-    fn report_slot_attribute_node_diagnostics(
-        &mut self,
-        node: &TemplateNode<'a>,
-        ancestors: &mut Vec<SlotAncestor>,
-    ) {
-        self.report_slot_attribute_tree_diagnostics(std::slice::from_ref(node), ancestors);
-    }
-
-    fn report_const_tag_placement_diagnostics(
-        &mut self,
-        nodes: &[TemplateNode<'a>],
-        const_allowed: bool,
-    ) {
-        for node in nodes {
-            self.report_const_tag_placement_node_diagnostics(node, const_allowed);
-        }
-    }
-
-    fn report_const_tag_placement_node_diagnostics(
-        &mut self,
-        node: &TemplateNode<'a>,
-        const_allowed: bool,
-    ) {
-        match node {
-            TemplateNode::ConstTag(_) if !const_allowed => {
-                self.report_error(const_tag_invalid_placement_message());
-            }
-            TemplateNode::Element(element) => {
-                self.report_const_tag_placement_diagnostics(
-                    &element.children,
-                    const_tag_allowed_in_element(element),
-                );
-            }
-            TemplateNode::IfBlock(block) => {
-                self.report_const_tag_placement_diagnostics(&block.consequent.nodes, true);
-                if let Some(alternate) = &block.alternate {
-                    self.report_const_tag_placement_node_diagnostics(alternate, true);
-                }
-            }
-            TemplateNode::EachBlock(block) => {
-                self.report_const_tag_placement_diagnostics(&block.body.nodes, true);
-                if let Some(fallback) = &block.fallback {
-                    self.report_const_tag_placement_diagnostics(&fallback.nodes, true);
-                }
-            }
-            TemplateNode::AwaitBlock(block) => {
-                for fragment in await_block_fragments(block) {
-                    self.report_const_tag_placement_diagnostics(&fragment.nodes, true);
-                }
-            }
-            TemplateNode::KeyBlock(block) => {
-                self.report_const_tag_placement_diagnostics(&block.body.nodes, true);
-            }
-            TemplateNode::SnippetBlock(block) => {
-                self.report_const_tag_placement_diagnostics(&block.body.nodes, true);
-            }
-            TemplateNode::Text(_)
-            | TemplateNode::MustacheTag(_)
-            | TemplateNode::RawMustacheTag(_)
-            | TemplateNode::DebugTag(_)
-            | TemplateNode::ConstTag(_)
-            | TemplateNode::RenderTag(_)
-            | TemplateNode::Comment(_) => {}
-        }
-    }
-
     fn report_text_placement_diagnostics(
         &mut self,
         nodes: &[TemplateNode<'a>],
         parent_element: Option<&str>,
     ) {
-        for node in nodes {
-            self.report_text_placement_node_diagnostics(node, parent_element);
-        }
-    }
-
-    fn report_text_placement_node_diagnostics(
-        &mut self,
-        node: &TemplateNode<'a>,
-        parent_element: Option<&str>,
-    ) {
-        match node {
-            TemplateNode::Text(text) if !text.data.trim().is_empty() => {
-                self.report_html_text_placement(parent_element);
-            }
-            TemplateNode::MustacheTag(_) => {
-                self.report_html_text_placement(parent_element);
-            }
-            TemplateNode::Element(element) => {
-                let next_parent = text_placement_parent_for_element(element, parent_element);
-                self.report_text_placement_diagnostics(&element.children, next_parent);
-            }
-            TemplateNode::IfBlock(block) => {
-                self.report_text_placement_diagnostics(&block.consequent.nodes, parent_element);
-                if let Some(alternate) = &block.alternate {
-                    self.report_text_placement_node_diagnostics(alternate, parent_element);
+        // Explicit-stack traversal (children pushed in reverse so nodes
+        // are checked in source order) — deeply nested templates must not
+        // overflow the call stack.
+        let mut stack: Vec<(&TemplateNode<'a>, Option<&str>)> = Vec::new();
+        stack.extend(nodes.iter().rev().map(|n| (n, parent_element)));
+        while let Some((node, parent_element)) = stack.pop() {
+            match node {
+                TemplateNode::Text(text) if !text.data.trim().is_empty() => {
+                    self.report_html_text_placement(parent_element);
                 }
-            }
-            TemplateNode::EachBlock(block) => {
-                self.report_text_placement_diagnostics(&block.body.nodes, parent_element);
-                if let Some(fallback) = &block.fallback {
-                    self.report_text_placement_diagnostics(&fallback.nodes, parent_element);
+                TemplateNode::MustacheTag(_) => {
+                    self.report_html_text_placement(parent_element);
                 }
-            }
-            TemplateNode::AwaitBlock(block) => {
-                for fragment in await_block_fragments(block) {
-                    self.report_text_placement_diagnostics(&fragment.nodes, parent_element);
+                TemplateNode::Element(element) => {
+                    let next_parent = text_placement_parent_for_element(element, parent_element);
+                    stack.extend(element.children.iter().rev().map(|n| (n, next_parent)));
                 }
+                TemplateNode::IfBlock(block) => {
+                    if let Some(alternate) = &block.alternate {
+                        stack.push((alternate.as_ref(), parent_element));
+                    }
+                    stack.extend(
+                        block
+                            .consequent
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, parent_element)),
+                    );
+                }
+                TemplateNode::EachBlock(block) => {
+                    if let Some(fallback) = &block.fallback {
+                        stack.extend(
+                            fallback
+                                .nodes
+                                .iter()
+                                .rev()
+                                .map(|n| (n, parent_element)),
+                        );
+                    }
+                    stack.extend(
+                        block
+                            .body
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, parent_element)),
+                    );
+                }
+                TemplateNode::AwaitBlock(block) => {
+                    let fragments: Vec<&Fragment> = await_block_fragments(block).collect();
+                    for fragment in fragments.into_iter().rev() {
+                        stack.extend(
+                            fragment
+                                .nodes
+                                .iter()
+                                .rev()
+                                .map(|n| (n, parent_element)),
+                        );
+                    }
+                }
+                TemplateNode::KeyBlock(block) => {
+                    stack.extend(
+                        block
+                            .body
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, parent_element)),
+                    );
+                }
+                TemplateNode::SnippetBlock(block) => {
+                    stack.extend(block.body.nodes.iter().rev().map(|n| (n, None)));
+                }
+                TemplateNode::RawMustacheTag(_)
+                | TemplateNode::DebugTag(_)
+                | TemplateNode::ConstTag(_)
+                | TemplateNode::RenderTag(_)
+                | TemplateNode::Comment(_)
+                | TemplateNode::Text(_) => {}
             }
-            TemplateNode::KeyBlock(block) => {
-                self.report_text_placement_diagnostics(&block.body.nodes, parent_element);
-            }
-            TemplateNode::SnippetBlock(block) => {
-                self.report_text_placement_diagnostics(&block.body.nodes, None);
-            }
-            TemplateNode::RawMustacheTag(_)
-            | TemplateNode::DebugTag(_)
-            | TemplateNode::ConstTag(_)
-            | TemplateNode::RenderTag(_)
-            | TemplateNode::Comment(_)
-            | TemplateNode::Text(_) => {}
         }
     }
 
@@ -3192,77 +3323,126 @@ impl<'a> TemplateParser<'a> {
         }
     }
 
-    fn report_element_placement_diagnostics(
+    fn report_element_placement_diagnostics<'n>(
         &mut self,
-        nodes: &[TemplateNode<'a>],
-        ancestors: &[HtmlPlacementAncestor<'_>],
+        nodes: &'n [TemplateNode<'a>],
+        ancestors: &[HtmlPlacementAncestor<'n>],
     ) {
-        for node in nodes {
-            self.report_element_placement_node_diagnostics(node, ancestors);
-        }
-    }
+        // Explicit-stack traversal (children pushed in reverse so nodes
+        // are checked in source order) — deeply nested templates must not
+        // overflow the call stack. Each stack entry carries the ancestor
+        // list the recursive version would have passed down.
+        let mut stack: Vec<(&'n TemplateNode<'a>, Vec<HtmlPlacementAncestor<'n>>)> = Vec::new();
+        stack.extend(
+            nodes
+                .iter()
+                .rev()
+                .map(|n| (n, ancestors.to_vec())),
+        );
+        while let Some((node, ancestors)) = stack.pop() {
+            match node {
+                TemplateNode::Element(element) => {
+                    if element_participates_in_html_placement(&element.name) {
+                        self.report_html_element_placement(&element.name, &ancestors);
+                    }
 
-    fn report_element_placement_node_diagnostics(
-        &mut self,
-        node: &TemplateNode<'a>,
-        ancestors: &[HtmlPlacementAncestor<'_>],
-    ) {
-        match node {
-            TemplateNode::Element(element) => {
-                if element_participates_in_html_placement(&element.name) {
-                    self.report_html_element_placement(&element.name, ancestors);
+                    if element.name == "slot" || element.name == "svelte:boundary" {
+                        stack.extend(
+                            element
+                                .children
+                                .iter()
+                                .rev()
+                                .map(|n| (n, ancestors.clone())),
+                        );
+                    } else if element.name.starts_with("svelte:")
+                        || is_regular_component_element_name(&element.name)
+                    {
+                        stack.extend(element.children.iter().rev().map(|n| (n, Vec::new())));
+                    } else {
+                        let mut next_ancestors = Vec::with_capacity(ancestors.len() + 1);
+                        next_ancestors.push(HtmlPlacementAncestor {
+                            name: element.name.as_str(),
+                            blocked_by_block: false,
+                        });
+                        next_ancestors.extend_from_slice(&ancestors);
+                        stack.extend(
+                            element
+                                .children
+                                .iter()
+                                .rev()
+                                .map(|n| (n, next_ancestors.clone())),
+                        );
+                    }
                 }
-
-                if element.name == "slot" || element.name == "svelte:boundary" {
-                    self.report_element_placement_diagnostics(&element.children, ancestors);
-                } else if element.name.starts_with("svelte:")
-                    || is_regular_component_element_name(&element.name)
-                {
-                    self.report_element_placement_diagnostics(&element.children, &[]);
-                } else {
-                    let mut next_ancestors = Vec::with_capacity(ancestors.len() + 1);
-                    next_ancestors.push(HtmlPlacementAncestor {
-                        name: element.name.as_str(),
-                        blocked_by_block: false,
-                    });
-                    next_ancestors.extend_from_slice(ancestors);
-                    self.report_element_placement_diagnostics(&element.children, &next_ancestors);
+                TemplateNode::IfBlock(block) => {
+                    let blocked = html_placement_ancestors_blocked(&ancestors);
+                    if let Some(alternate) = &block.alternate {
+                        stack.push((alternate.as_ref(), blocked.clone()));
+                    }
+                    stack.extend(
+                        block
+                            .consequent
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, blocked.clone())),
+                    );
                 }
-            }
-            TemplateNode::IfBlock(block) => {
-                let blocked = html_placement_ancestors_blocked(ancestors);
-                self.report_element_placement_diagnostics(&block.consequent.nodes, &blocked);
-                if let Some(alternate) = &block.alternate {
-                    self.report_element_placement_node_diagnostics(alternate, &blocked);
+                TemplateNode::EachBlock(block) => {
+                    let blocked = html_placement_ancestors_blocked(&ancestors);
+                    if let Some(fallback) = &block.fallback {
+                        stack.extend(
+                            fallback
+                                .nodes
+                                .iter()
+                                .rev()
+                                .map(|n| (n, blocked.clone())),
+                        );
+                    }
+                    stack.extend(
+                        block
+                            .body
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, blocked.clone())),
+                    );
                 }
-            }
-            TemplateNode::EachBlock(block) => {
-                let blocked = html_placement_ancestors_blocked(ancestors);
-                self.report_element_placement_diagnostics(&block.body.nodes, &blocked);
-                if let Some(fallback) = &block.fallback {
-                    self.report_element_placement_diagnostics(&fallback.nodes, &blocked);
+                TemplateNode::AwaitBlock(block) => {
+                    let blocked = html_placement_ancestors_blocked(&ancestors);
+                    let fragments: Vec<&Fragment> = await_block_fragments(block).collect();
+                    for fragment in fragments.into_iter().rev() {
+                        stack.extend(
+                            fragment
+                                .nodes
+                                .iter()
+                                .rev()
+                                .map(|n| (n, blocked.clone())),
+                        );
+                    }
                 }
-            }
-            TemplateNode::AwaitBlock(block) => {
-                let blocked = html_placement_ancestors_blocked(ancestors);
-                for fragment in await_block_fragments(block) {
-                    self.report_element_placement_diagnostics(&fragment.nodes, &blocked);
+                TemplateNode::KeyBlock(block) => {
+                    let blocked = html_placement_ancestors_blocked(&ancestors);
+                    stack.extend(
+                        block
+                            .body
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, blocked.clone())),
+                    );
                 }
+                TemplateNode::SnippetBlock(block) => {
+                    stack.extend(block.body.nodes.iter().rev().map(|n| (n, Vec::new())));
+                }
+                TemplateNode::Text(_)
+                | TemplateNode::MustacheTag(_)
+                | TemplateNode::RawMustacheTag(_)
+                | TemplateNode::DebugTag(_)
+                | TemplateNode::ConstTag(_)
+                | TemplateNode::RenderTag(_)
+                | TemplateNode::Comment(_) => {}
             }
-            TemplateNode::KeyBlock(block) => {
-                let blocked = html_placement_ancestors_blocked(ancestors);
-                self.report_element_placement_diagnostics(&block.body.nodes, &blocked);
-            }
-            TemplateNode::SnippetBlock(block) => {
-                self.report_element_placement_diagnostics(&block.body.nodes, &[]);
-            }
-            TemplateNode::Text(_)
-            | TemplateNode::MustacheTag(_)
-            | TemplateNode::RawMustacheTag(_)
-            | TemplateNode::DebugTag(_)
-            | TemplateNode::ConstTag(_)
-            | TemplateNode::RenderTag(_)
-            | TemplateNode::Comment(_) => {}
         }
     }
 
@@ -3294,57 +3474,70 @@ impl<'a> TemplateParser<'a> {
         nodes: &[TemplateNode<'a>],
         each_context: Option<EachMotionContext>,
     ) {
-        for node in nodes {
-            self.report_motion_directive_node_diagnostics(node, each_context);
-        }
-    }
-
-    fn report_motion_directive_node_diagnostics(
-        &mut self,
-        node: &TemplateNode<'a>,
-        each_context: Option<EachMotionContext>,
-    ) {
-        match node {
-            TemplateNode::Element(element) => {
-                if uses_regular_element_attribute_rules(&element.name) {
-                    self.report_element_motion_directives(&element.attributes, each_context);
+        // Explicit-stack traversal (children pushed in reverse so nodes
+        // are checked in source order) — deeply nested templates must not
+        // overflow the call stack.
+        let mut stack: Vec<(&TemplateNode<'a>, Option<EachMotionContext>)> = Vec::new();
+        stack.extend(nodes.iter().rev().map(|n| (n, each_context)));
+        while let Some((node, each_context)) = stack.pop() {
+            match node {
+                TemplateNode::Element(element) => {
+                    if uses_regular_element_attribute_rules(&element.name) {
+                        self.report_element_motion_directives(&element.attributes, each_context);
+                    }
+                    stack.extend(element.children.iter().rev().map(|n| (n, None)));
                 }
-                self.report_motion_directive_diagnostics(&element.children, None);
-            }
-            TemplateNode::IfBlock(block) => {
-                self.report_motion_directive_diagnostics(&block.consequent.nodes, None);
-                if let Some(alternate) = &block.alternate {
-                    self.report_motion_directive_node_diagnostics(alternate, None);
+                TemplateNode::IfBlock(block) => {
+                    if let Some(alternate) = &block.alternate {
+                        stack.push((alternate.as_ref(), None));
+                    }
+                    stack.extend(block.consequent.nodes.iter().rev().map(|n| (n, None)));
                 }
-            }
-            TemplateNode::EachBlock(block) => {
-                let context = EachMotionContext {
-                    keyed: block.key.as_ref().is_some_and(|key| !key.trim().is_empty()),
-                    significant_body_children: motion_significant_child_count(&block.body.nodes),
-                };
-                self.report_motion_directive_diagnostics(&block.body.nodes, Some(context));
-                if let Some(fallback) = &block.fallback {
-                    self.report_motion_directive_diagnostics(&fallback.nodes, Some(context));
+                TemplateNode::EachBlock(block) => {
+                    let context = EachMotionContext {
+                        keyed: block.key.as_ref().is_some_and(|key| !key.trim().is_empty()),
+                        significant_body_children: motion_significant_child_count(
+                            &block.body.nodes,
+                        ),
+                    };
+                    if let Some(fallback) = &block.fallback {
+                        stack.extend(
+                            fallback
+                                .nodes
+                                .iter()
+                                .rev()
+                                .map(|n| (n, Some(context))),
+                        );
+                    }
+                    stack.extend(
+                        block
+                            .body
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, Some(context))),
+                    );
                 }
-            }
-            TemplateNode::AwaitBlock(block) => {
-                for fragment in await_block_fragments(block) {
-                    self.report_motion_directive_diagnostics(&fragment.nodes, None);
+                TemplateNode::AwaitBlock(block) => {
+                    let fragments: Vec<&Fragment> = await_block_fragments(block).collect();
+                    for fragment in fragments.into_iter().rev() {
+                        stack.extend(fragment.nodes.iter().rev().map(|n| (n, None)));
+                    }
                 }
+                TemplateNode::KeyBlock(block) => {
+                    stack.extend(block.body.nodes.iter().rev().map(|n| (n, None)));
+                }
+                TemplateNode::SnippetBlock(block) => {
+                    stack.extend(block.body.nodes.iter().rev().map(|n| (n, None)));
+                }
+                TemplateNode::Text(_)
+                | TemplateNode::MustacheTag(_)
+                | TemplateNode::RawMustacheTag(_)
+                | TemplateNode::DebugTag(_)
+                | TemplateNode::ConstTag(_)
+                | TemplateNode::RenderTag(_)
+                | TemplateNode::Comment(_) => {}
             }
-            TemplateNode::KeyBlock(block) => {
-                self.report_motion_directive_diagnostics(&block.body.nodes, None);
-            }
-            TemplateNode::SnippetBlock(block) => {
-                self.report_motion_directive_diagnostics(&block.body.nodes, None);
-            }
-            TemplateNode::Text(_)
-            | TemplateNode::MustacheTag(_)
-            | TemplateNode::RawMustacheTag(_)
-            | TemplateNode::DebugTag(_)
-            | TemplateNode::ConstTag(_)
-            | TemplateNode::RenderTag(_)
-            | TemplateNode::Comment(_) => {}
         }
     }
 
@@ -4367,6 +4560,9 @@ impl<'a> TemplateParser<'a> {
     // ─── Block parsers ─────────────────────────────────────────────────
 
     fn parse_if_block(&mut self) -> Result<FragmentStep<'a>, OxcDiagnostic> {
+        if self.at_template_depth_limit() {
+            return Ok(FragmentStep::Continue);
+        }
         let start = self.pos as u32;
         self.eat("{#if")?;
         self.skip_whitespace();
@@ -4396,6 +4592,9 @@ impl<'a> TemplateParser<'a> {
     }
 
     fn parse_each_block(&mut self) -> Result<FragmentStep<'a>, OxcDiagnostic> {
+        if self.at_template_depth_limit() {
+            return Ok(FragmentStep::Continue);
+        }
         let start = self.pos as u32;
         self.eat("{#each")?;
         self.skip_whitespace();
@@ -4444,6 +4643,9 @@ impl<'a> TemplateParser<'a> {
     }
 
     fn parse_await_block(&mut self) -> Result<FragmentStep<'a>, OxcDiagnostic> {
+        if self.at_template_depth_limit() {
+            return Ok(FragmentStep::Continue);
+        }
         let start = self.pos as u32;
         self.eat("{#await")?;
         self.skip_whitespace();
@@ -4502,6 +4704,9 @@ impl<'a> TemplateParser<'a> {
     }
 
     fn parse_key_block(&mut self) -> Result<FragmentStep<'a>, OxcDiagnostic> {
+        if self.at_template_depth_limit() {
+            return Ok(FragmentStep::Continue);
+        }
         let start = self.pos as u32;
         self.eat("{#key")?;
         self.skip_whitespace();
@@ -4522,6 +4727,9 @@ impl<'a> TemplateParser<'a> {
     }
 
     fn parse_snippet_block(&mut self) -> Result<FragmentStep<'a>, OxcDiagnostic> {
+        if self.at_template_depth_limit() {
+            return Ok(FragmentStep::Continue);
+        }
         let start = self.pos as u32;
         self.eat("{#snippet")?;
         self.skip_whitespace();
@@ -6110,45 +6318,44 @@ fn walk_template_nodes<'node, 'a, F>(nodes: &'node [TemplateNode<'a>], visitor: 
 where
     F: FnMut(&'node TemplateNode<'a>),
 {
-    for node in nodes {
-        walk_template_node(node, visitor);
-    }
-}
+    // Explicit-stack pre-order walk (children pushed in reverse so nodes
+    // are visited in source order). Deeply nested templates must not
+    // overflow the call stack.
+    let mut stack: Vec<&'node TemplateNode<'a>> = Vec::new();
+    stack.extend(nodes.iter().rev());
+    while let Some(node) = stack.pop() {
+        visitor(node);
 
-fn walk_template_node<'node, 'a, F>(node: &'node TemplateNode<'a>, visitor: &mut F)
-where
-    F: FnMut(&'node TemplateNode<'a>),
-{
-    visitor(node);
-
-    match node {
-        TemplateNode::Element(element) => walk_template_nodes(&element.children, visitor),
-        TemplateNode::IfBlock(block) => {
-            walk_template_nodes(&block.consequent.nodes, visitor);
-            if let Some(alternate) = &block.alternate {
-                walk_template_node(alternate.as_ref(), visitor);
+        match node {
+            TemplateNode::Element(element) => stack.extend(element.children.iter().rev()),
+            TemplateNode::IfBlock(block) => {
+                if let Some(alternate) = &block.alternate {
+                    stack.push(alternate.as_ref());
+                }
+                stack.extend(block.consequent.nodes.iter().rev());
             }
-        }
-        TemplateNode::EachBlock(block) => {
-            walk_template_nodes(&block.body.nodes, visitor);
-            if let Some(fallback) = &block.fallback {
-                walk_template_nodes(&fallback.nodes, visitor);
+            TemplateNode::EachBlock(block) => {
+                if let Some(fallback) = &block.fallback {
+                    stack.extend(fallback.nodes.iter().rev());
+                }
+                stack.extend(block.body.nodes.iter().rev());
             }
-        }
-        TemplateNode::AwaitBlock(block) => {
-            for fragment in await_block_fragments(block) {
-                walk_template_nodes(&fragment.nodes, visitor);
+            TemplateNode::AwaitBlock(block) => {
+                let fragments: Vec<&Fragment> = await_block_fragments(block).collect();
+                for fragment in fragments.into_iter().rev() {
+                    stack.extend(fragment.nodes.iter().rev());
+                }
             }
+            TemplateNode::KeyBlock(block) => stack.extend(block.body.nodes.iter().rev()),
+            TemplateNode::SnippetBlock(block) => stack.extend(block.body.nodes.iter().rev()),
+            TemplateNode::Text(_)
+            | TemplateNode::MustacheTag(_)
+            | TemplateNode::RawMustacheTag(_)
+            | TemplateNode::DebugTag(_)
+            | TemplateNode::ConstTag(_)
+            | TemplateNode::RenderTag(_)
+            | TemplateNode::Comment(_) => {}
         }
-        TemplateNode::KeyBlock(block) => walk_template_nodes(&block.body.nodes, visitor),
-        TemplateNode::SnippetBlock(block) => walk_template_nodes(&block.body.nodes, visitor),
-        TemplateNode::Text(_)
-        | TemplateNode::MustacheTag(_)
-        | TemplateNode::RawMustacheTag(_)
-        | TemplateNode::DebugTag(_)
-        | TemplateNode::ConstTag(_)
-        | TemplateNode::RenderTag(_)
-        | TemplateNode::Comment(_) => {}
     }
 }
 
@@ -6170,128 +6377,146 @@ fn collect_slot_snippet_usage(
     in_shadowroot_template: bool,
     allocator: &Allocator,
 ) {
-    for node in nodes {
-        collect_slot_snippet_node_usage(node, usage, in_shadowroot_template, allocator);
-    }
-}
+    // Explicit-stack traversal — deeply nested templates must not overflow
+    // the call stack.
+    let mut stack: Vec<(&TemplateNode<'_>, bool)> = Vec::new();
+    stack.extend(nodes.iter().rev().map(|n| (n, in_shadowroot_template)));
+    while let Some((node, in_shadowroot_template)) = stack.pop() {
+        match node {
+            TemplateNode::Element(element) => {
+                if element.name == "slot" && !in_shadowroot_template {
+                    usage.uses_slot_element = true;
+                }
+                for attribute in &element.attributes {
+                    if attribute_value_uses_slots_identifier(attribute_value(attribute), allocator)
+                    {
+                        usage.uses_slots_identifier = true;
+                    }
+                }
 
-fn collect_slot_snippet_node_usage(
-    node: &TemplateNode<'_>,
-    usage: &mut SlotSnippetUsage,
-    in_shadowroot_template: bool,
-    allocator: &Allocator,
-) {
-    match node {
-        TemplateNode::Element(element) => {
-            if element.name == "slot" && !in_shadowroot_template {
-                usage.uses_slot_element = true;
+                let next_shadowroot_template = in_shadowroot_template
+                    || is_shadowroot_template_element(&element.name, &element.attributes);
+                stack.extend(
+                    element
+                        .children
+                        .iter()
+                        .rev()
+                        .map(|n| (n, next_shadowroot_template)),
+                );
             }
-            for attribute in &element.attributes {
-                if attribute_value_uses_slots_identifier(attribute_value(attribute), allocator) {
+            TemplateNode::MustacheTag(tag) => {
+                if expression_uses_slots_identifier(&tag.expression, allocator) {
                     usage.uses_slots_identifier = true;
                 }
             }
-
-            let next_shadowroot_template = in_shadowroot_template
-                || is_shadowroot_template_element(&element.name, &element.attributes);
-            collect_slot_snippet_usage(
-                &element.children,
-                usage,
-                next_shadowroot_template,
-                allocator,
-            );
-        }
-        TemplateNode::MustacheTag(tag) => {
-            if expression_uses_slots_identifier(&tag.expression, allocator) {
-                usage.uses_slots_identifier = true;
+            TemplateNode::RawMustacheTag(tag) => {
+                if expression_uses_slots_identifier(&tag.expression, allocator) {
+                    usage.uses_slots_identifier = true;
+                }
             }
-        }
-        TemplateNode::RawMustacheTag(tag) => {
-            if expression_uses_slots_identifier(&tag.expression, allocator) {
-                usage.uses_slots_identifier = true;
+            TemplateNode::DebugTag(tag) => {
+                if tag
+                    .identifiers
+                    .iter()
+                    .any(|identifier| identifier == "$$slots")
+                {
+                    usage.uses_slots_identifier = true;
+                }
             }
-        }
-        TemplateNode::DebugTag(tag) => {
-            if tag
-                .identifiers
-                .iter()
-                .any(|identifier| identifier == "$$slots")
-            {
-                usage.uses_slots_identifier = true;
+            TemplateNode::ConstTag(tag) => {
+                if const_declaration_uses_slots_identifier(&tag.declaration) {
+                    usage.uses_slots_identifier = true;
+                }
             }
-        }
-        TemplateNode::ConstTag(tag) => {
-            if const_declaration_uses_slots_identifier(&tag.declaration) {
-                usage.uses_slots_identifier = true;
+            TemplateNode::RenderTag(tag) => {
+                usage.uses_render_tags = true;
+                if expression_uses_slots_identifier(&tag.expression, allocator) {
+                    usage.uses_slots_identifier = true;
+                }
             }
-        }
-        TemplateNode::RenderTag(tag) => {
-            usage.uses_render_tags = true;
-            if expression_uses_slots_identifier(&tag.expression, allocator) {
-                usage.uses_slots_identifier = true;
-            }
-        }
-        TemplateNode::IfBlock(block) => {
-            if expression_uses_slots_identifier(&block.test, allocator) {
-                usage.uses_slots_identifier = true;
-            }
-            collect_slot_snippet_usage(
-                &block.consequent.nodes,
-                usage,
-                in_shadowroot_template,
-                allocator,
-            );
-            if let Some(alternate) = &block.alternate {
-                collect_slot_snippet_node_usage(
-                    alternate,
-                    usage,
-                    in_shadowroot_template,
-                    allocator,
+            TemplateNode::IfBlock(block) => {
+                if expression_uses_slots_identifier(&block.test, allocator) {
+                    usage.uses_slots_identifier = true;
+                }
+                if let Some(alternate) = &block.alternate {
+                    stack.push((alternate.as_ref(), in_shadowroot_template));
+                }
+                stack.extend(
+                    block
+                        .consequent
+                        .nodes
+                        .iter()
+                        .rev()
+                        .map(|n| (n, in_shadowroot_template)),
                 );
             }
-        }
-        TemplateNode::EachBlock(block) => {
-            if expression_uses_slots_identifier(&block.expression, allocator)
-                || block
-                    .key
-                    .as_ref()
-                    .is_some_and(|key| expression_uses_slots_identifier(key, allocator))
-            {
-                usage.uses_slots_identifier = true;
-            }
-            collect_slot_snippet_usage(&block.body.nodes, usage, in_shadowroot_template, allocator);
-            if let Some(fallback) = &block.fallback {
-                collect_slot_snippet_usage(
-                    &fallback.nodes,
-                    usage,
-                    in_shadowroot_template,
-                    allocator,
+            TemplateNode::EachBlock(block) => {
+                if expression_uses_slots_identifier(&block.expression, allocator)
+                    || block
+                        .key
+                        .as_ref()
+                        .is_some_and(|key| expression_uses_slots_identifier(key, allocator))
+                {
+                    usage.uses_slots_identifier = true;
+                }
+                if let Some(fallback) = &block.fallback {
+                    stack.extend(
+                        fallback
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, in_shadowroot_template)),
+                    );
+                }
+                stack.extend(
+                    block
+                        .body
+                        .nodes
+                        .iter()
+                        .rev()
+                        .map(|n| (n, in_shadowroot_template)),
                 );
             }
-        }
-        TemplateNode::AwaitBlock(block) => {
-            if expression_uses_slots_identifier(&block.expression, allocator) {
-                usage.uses_slots_identifier = true;
+            TemplateNode::AwaitBlock(block) => {
+                if expression_uses_slots_identifier(&block.expression, allocator) {
+                    usage.uses_slots_identifier = true;
+                }
+                let fragments: Vec<&Fragment> = await_block_fragments(block).collect();
+                for fragment in fragments.into_iter().rev() {
+                    stack.extend(
+                        fragment
+                            .nodes
+                            .iter()
+                            .rev()
+                            .map(|n| (n, in_shadowroot_template)),
+                    );
+                }
             }
-            for fragment in await_block_fragments(block) {
-                collect_slot_snippet_usage(
-                    &fragment.nodes,
-                    usage,
-                    in_shadowroot_template,
-                    allocator,
+            TemplateNode::KeyBlock(block) => {
+                if expression_uses_slots_identifier(&block.expression, allocator) {
+                    usage.uses_slots_identifier = true;
+                }
+                stack.extend(
+                    block
+                        .body
+                        .nodes
+                        .iter()
+                        .rev()
+                        .map(|n| (n, in_shadowroot_template)),
                 );
             }
-        }
-        TemplateNode::KeyBlock(block) => {
-            if expression_uses_slots_identifier(&block.expression, allocator) {
-                usage.uses_slots_identifier = true;
+            TemplateNode::SnippetBlock(block) => {
+                stack.extend(
+                    block
+                        .body
+                        .nodes
+                        .iter()
+                        .rev()
+                        .map(|n| (n, in_shadowroot_template)),
+                );
             }
-            collect_slot_snippet_usage(&block.body.nodes, usage, in_shadowroot_template, allocator);
+            TemplateNode::Text(_) | TemplateNode::Comment(_) => {}
         }
-        TemplateNode::SnippetBlock(block) => {
-            collect_slot_snippet_usage(&block.body.nodes, usage, in_shadowroot_template, allocator);
-        }
-        TemplateNode::Text(_) | TemplateNode::Comment(_) => {}
     }
 }
 
@@ -7400,6 +7625,168 @@ fn is_void_element(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deepest `Element` / block nesting in `nodes`, computed iteratively
+    /// so the check itself can't overflow on deep trees.
+    fn deepest_nesting(nodes: &[TemplateNode]) -> usize {
+        let mut max_depth = 0;
+        let mut stack: Vec<(&TemplateNode, usize)> = nodes.iter().map(|n| (n, 1)).collect();
+        while let Some((node, depth)) = stack.pop() {
+            match node {
+                TemplateNode::Element(el) => {
+                    max_depth = max_depth.max(depth);
+                    stack.extend(el.children.iter().map(|n| (n, depth + 1)));
+                }
+                TemplateNode::IfBlock(b) => {
+                    max_depth = max_depth.max(depth);
+                    stack.extend(b.consequent.nodes.iter().map(|n| (n, depth + 1)));
+                    if let Some(alt) = &b.alternate {
+                        stack.push((alt.as_ref(), depth + 1));
+                    }
+                }
+                TemplateNode::EachBlock(b) => {
+                    max_depth = max_depth.max(depth);
+                    stack.extend(b.body.nodes.iter().map(|n| (n, depth + 1)));
+                    if let Some(fb) = &b.fallback {
+                        stack.extend(fb.nodes.iter().map(|n| (n, depth + 1)));
+                    }
+                }
+                TemplateNode::AwaitBlock(b) => {
+                    max_depth = max_depth.max(depth);
+                    for fragment in [&b.pending, &b.then, &b.catch].into_iter().flatten() {
+                        stack.extend(fragment.nodes.iter().map(|n| (n, depth + 1)));
+                    }
+                }
+                TemplateNode::KeyBlock(b) => {
+                    max_depth = max_depth.max(depth);
+                    stack.extend(b.body.nodes.iter().map(|n| (n, depth + 1)));
+                }
+                TemplateNode::SnippetBlock(b) => {
+                    max_depth = max_depth.max(depth);
+                    stack.extend(b.body.nodes.iter().map(|n| (n, depth + 1)));
+                }
+                _ => {}
+            }
+        }
+        max_depth
+    }
+
+    #[test]
+    fn deep_element_nesting_is_capped_with_parse_error() {
+        let depth = MAX_OPEN_NODE_DEPTH * 3;
+        let mut source = "<div>".repeat(depth);
+        source.push('x');
+        source.push_str(&"</div>".repeat(depth));
+        let alloc = oxc::allocator::Allocator::default();
+        let (fragment, errors) = parse_fragment_with_errors(&source, &alloc);
+        assert!(
+            errors
+                .iter()
+                .any(|e| format!("{e:?}").contains("Maximum template nesting depth")),
+            "expected a depth-limit parse error, got: {errors:?}"
+        );
+        assert!(
+            deepest_nesting(&fragment.nodes) <= MAX_OPEN_NODE_DEPTH,
+            "AST nesting must stay within the cap"
+        );
+    }
+
+    #[test]
+    fn deep_else_if_chain_is_capped_with_parse_error() {
+        let mut source = "{#if a}x".to_string();
+        for _ in 0..(MAX_OPEN_NODE_DEPTH * 3) {
+            source.push_str("{:else if b}y");
+        }
+        source.push_str("{:else}z{/if}");
+        let alloc = oxc::allocator::Allocator::default();
+        let (fragment, errors) = parse_fragment_with_errors(&source, &alloc);
+        assert!(
+            errors
+                .iter()
+                .any(|e| format!("{e:?}").contains("Maximum template nesting depth")),
+            "expected a depth-limit parse error, got: {errors:?}"
+        );
+        assert!(
+            deepest_nesting(&fragment.nodes) <= MAX_OPEN_NODE_DEPTH,
+            "AST nesting must stay within the cap"
+        );
+    }
+
+    #[test]
+    fn nesting_below_limit_parses_cleanly() {
+        let depth = 250;
+        let mut source = "<div>".repeat(depth);
+        source.push('x');
+        source.push_str(&"</div>".repeat(depth));
+        let alloc = oxc::allocator::Allocator::default();
+        let (fragment, errors) = parse_fragment_with_errors(&source, &alloc);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(deepest_nesting(&fragment.nodes), depth);
+    }
+
+    #[test]
+    fn stray_continuation_at_root_recovers_and_keeps_parsing() {
+        let source = "<p>a</p>{:else}<p>b</p>";
+        let alloc = oxc::allocator::Allocator::default();
+        let (fragment, errors) = parse_fragment_with_errors(source, &alloc);
+        assert!(
+            errors
+                .iter()
+                .any(|e| format!("{e:?}").contains("block is invalid at this position")),
+            "expected an invalid-continuation-placement parse error, got: {errors:?}"
+        );
+        assert_eq!(
+            fragment.nodes.len(),
+            2,
+            "content after the stray continuation must not be dropped: {:?}",
+            fragment.nodes
+        );
+    }
+
+    #[test]
+    fn stray_continuation_inside_element_keeps_element_open() {
+        // Vendor Svelte reports `block_invalid_continuation_placement` here
+        // and never closes the element to reach an outer block — so exactly
+        // one error, and the span stays inside the div.
+        let source = "<div>{:foo}<span>x</span></div>";
+        let alloc = oxc::allocator::Allocator::default();
+        let (fragment, errors) = parse_fragment_with_errors(source, &alloc);
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one error for the stray continuation, got: {errors:?}"
+        );
+        assert!(
+            format!("{:?}", errors[0]).contains("block is invalid at this position"),
+            "unexpected error: {errors:?}"
+        );
+        let [TemplateNode::Element(div)] = &fragment.nodes[..] else {
+            panic!("expected a single root element, got: {:?}", fragment.nodes);
+        };
+        assert_eq!(div.name, "div");
+        assert!(
+            matches!(div.children.as_slice(), [TemplateNode::Element(el)] if el.name == "span"),
+            "span must remain a child of the div: {:?}",
+            div.children
+        );
+    }
+
+    #[test]
+    fn node_parse_error_keeps_partial_fragment() {
+        let source = "<p>a</p><!-- unterminated";
+        let alloc = oxc::allocator::Allocator::default();
+        let (fragment, errors) = parse_fragment_with_errors(source, &alloc);
+        assert!(
+            !errors.is_empty(),
+            "expected a parse error for the unterminated comment"
+        );
+        assert_eq!(
+            fragment.nodes.len(),
+            1,
+            "nodes parsed before the error must be kept: {:?}",
+            fragment.nodes
+        );
+    }
 
     #[test]
     fn test_parse_text() {

@@ -182,7 +182,7 @@ impl Rule for RequireStoreReactiveAccess {
                         continue;
                     }
                     if p == b'.' {
-                        let is_spread = pos >= 3 && &content[pos - 3..pos] == "...";
+                        let is_spread = content.get(pos.saturating_sub(3)..pos) == Some("...");
                         if !is_spread {
                             continue;
                         }
